@@ -205,6 +205,7 @@ pub const Loop = struct {
                         c.result = c.syscall_result(ecanceled);
                         c.flags.state = .dead;
                         self.completions.push(c);
+                        c.flags.queued = true;
 
                         events[events_len] = ev;
                         events[events_len].flags = std.c.EV.DELETE;
@@ -265,6 +266,7 @@ pub const Loop = struct {
 
                 assert(c.result != null);
                 self.completions.push(c);
+                c.flags.queued = true;
             }
         }
     }
@@ -294,6 +296,7 @@ pub const Loop = struct {
             // We completed the cancellation.
             c.result = .{ .cancel = {} };
             self.completions.push(c);
+            c.flags.queued = true;
         }
     }
 
@@ -413,11 +416,15 @@ pub const Loop = struct {
             if (self.thread_pool != null) {
                 while (self.thread_pool_completions.pop()) |c| {
                     self.completions.push(c);
+                    c.flags.queued = true;
                 }
             }
 
             // Process the completions we already have completed.
             while (self.completions.pop()) |c| {
+                // droid#226: no longer linked in any loop queue.
+                c.flags.queued = false;
+
                 // disarm_ev is the Kevent to use for disarming if the
                 // completion wants to disarm. We have to calculate this up
                 // front because c can be reused in callback.
@@ -440,7 +447,34 @@ pub const Loop = struct {
                 wait_rem -|= 1;
 
                 // Completion queue items MUST have a result set.
-                const action = c.callback(c.userdata, self, c, c.result.?);
+                //
+                // droid#226: when this does not hold, the completion was
+                // re-initialised while still linked here, which nulls both
+                // `result` and `next`. Name it rather than unwrapping blind —
+                // `op` distinguishes Ghostty's `termios_timer_c` from its
+                // `process_wait_c`, and the address confirms which field of
+                // `termio.Exec`'s ThreadData it is. `std.debug.print` rather
+                // than `std.log` so this always reaches fd 2, which termz
+                // captures to `~/Library/Logs/Termz/termz.log`.
+                const result = c.result orelse {
+                    std.debug.print(
+                        "libxev droid#226: completion popped with null result: " ++
+                            "c=0x{x} op={s} state={s} queued={} threadpool={} " ++
+                            "next=0x{x} userdata=0x{x} c_active={}\n",
+                        .{
+                            @intFromPtr(c),
+                            @tagName(c.op),
+                            @tagName(c.flags.state),
+                            c.flags.queued,
+                            c.flags.threadpool,
+                            @intFromPtr(c.next),
+                            @intFromPtr(c.userdata),
+                            c_active,
+                        },
+                    );
+                    @panic("libxev: completion re-armed while queued (droid#226)");
+                };
+                const action = c.callback(c.userdata, self, c, result);
                 switch (action) {
                     // If we're active we have to schedule a delete. Otherwise
                     // we do nothing because we were never part of the kqueue.
@@ -607,6 +641,11 @@ pub const Loop = struct {
         userdata: ?*anyopaque,
         comptime cb: Callback,
     ) void {
+        // droid#226: this reset nulls `result` and `next`. Doing it to a
+        // completion that is still linked in `completions` both loses the
+        // pending result and severs the queue behind it.
+        assert(!c.flags.queued);
+
         c.* = .{
             .op = .{
                 .timer = .{
@@ -655,6 +694,11 @@ pub const Loop = struct {
                 // and do nothing.
                 if (c_cancel.state() == .active) return;
                 assert(c_cancel.state() == .dead and c.state() == .active);
+                // droid#226: same hazard as `timer`, and the guard above
+                // cannot see it — `state()` reports `.dead` for a completion
+                // `stop_completion` has already queued with a result.
+                assert(!c_cancel.flags.queued);
+
                 c_cancel.* = .{ .op = .{ .cancel = .{ .c = c } } };
                 self.add(c_cancel);
             },
@@ -874,6 +918,7 @@ pub const Loop = struct {
                     const eperm = errno_to_result(.PERM);
                     c.result = c.syscall_result(eperm);
                     self.completions.push(c);
+                    c.flags.queued = true;
                     return false;
                 };
 
@@ -893,6 +938,7 @@ pub const Loop = struct {
             .result => |result| {
                 c.result = c.syscall_result(result);
                 self.completions.push(c);
+                c.flags.queued = true;
 
                 return false;
             },
@@ -941,6 +987,7 @@ pub const Loop = struct {
                 // Add to our completions so we trigger the callback.
                 c.result = .{ .timer = .cancel };
                 self.completions.push(c);
+                c.flags.queued = true;
 
                 // Note the timers state purposely remains ACTIVE so that
                 // when we process the completion we decrement the
@@ -960,6 +1007,7 @@ pub const Loop = struct {
         c.result = c.perform(null);
 
         // Add to our completion queue
+        c.flags.queued = true;
         c.task_loop.thread_pool_completions.push(c);
 
         if (comptime builtin.target.os.tag.isDarwin()) {
@@ -1005,6 +1053,18 @@ pub const Completion = struct {
         /// the thread pool then it will NOT be registered with kqueue even
         /// if it is supported.
         threadpool: bool = false,
+
+        /// droid#226 instrumentation. True while this completion is linked
+        /// into `Loop.completions` or `Loop.thread_pool_completions`.
+        ///
+        /// `state` cannot answer this question: it maps adding/deleting/active
+        /// alike onto `.active` and says `.dead` for a completion that
+        /// `stop_completion` has queued with a result, so every guard written
+        /// in terms of `state()` is blind to the queue. Re-initialising a
+        /// completion that is still linked nulls both `result` and `next`,
+        /// which is what makes `tick` pop it with no result and severs the
+        /// rest of the queue behind it.
+        queued: bool = false,
     } = .{},
 
     /// If scheduled on a thread pool, this will be set. This is NOT a

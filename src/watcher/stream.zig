@@ -795,6 +795,15 @@ pub fn Writeable(comptime xev: type, comptime T: type, comptime options: Options
                 r: xev.WriteError!usize,
             ) xev.CallbackAction,
         ) void {
+            // droid#226: this resets the *whole* WriteRequest, and the
+            // completion is an embedded field, so it nulls `completion.result`
+            // and `completion.next`. If this request is recycled from a pool
+            // while its completion is still linked in `loop.completions`, the
+            // loop later pops a completion whose result is null and unwraps it.
+            // Ghostty hands us requests from a ring pool that recycles by
+            // counter and requires puts in order, so an out-of-order put lands
+            // exactly here.
+            assert(!req.completion.flags.queued);
             // Initialize our completion
             req.* = .{ .full_write_buffer = buf };
             // Must be kept in sync with partial write logic inside the callback
@@ -958,6 +967,9 @@ pub fn Writeable(comptime xev: type, comptime T: type, comptime options: Options
             c: *xev.Completion,
             buf: xev.WriteBuffer,
         ) void {
+            // droid#226: same hazard as queueWrite — this whole-struct reset
+            // nulls `result`, so the completion must not still be queued.
+            assert(!c.flags.queued);
             switch (buf) {
                 inline .slice, .array => {
                     c.* = .{
